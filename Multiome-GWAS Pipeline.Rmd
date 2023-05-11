@@ -1,0 +1,288 @@
+---
+title: "Multiome-GWAS Pipeline"
+output: html_notebook
+---
+
+#Load required packages
+```{r}
+library(Seurat)
+library(tidyverse)
+library(Signac)
+library(ggpubr)
+library(biomaRt)
+library(matrixStats)
+library(unikn)
+library(patchwork)
+install.packages('devtools')
+devtools::install_github('git@github.com:oyhel/vautils.git')
+library(vautils)
+```
+
+#Import Multiome Files
+```{r}
+#I usually start with my multiome files in a list, which makes it easier to do things in a loop
+Multi = list("CM001" = CM001_MultiomeFile, "CM003A" = CM003A_MultiomeFile, "CM003B" = CM003B_MultiomeFile,  "CM007" = CM007_MultiomeFile, "CM008" = CM008_MultiomeFile)
+MultiAssign = list("CM001" = CM001_MultiomeAssignments, "CM003A" = CM003A_MultiomeAssignments, "CM003B" = CM003B_MultiomeAssignments,  "CM007" = CM007_MultiomeAssignments, "CM008" = CM008_MultiomeAssignments)
+```
+
+#Import GWAS summary statistics
+```{r}
+BMI_GWAS = read.table("~/Dropbox/LabMac/Meta-analysis_Locke_et_al+UKBiobank_2018_UPDATED.txt", head=T) #This is a GWAS summary statistics file. I put it in teh dropbox but it is also here: https://portals.broadinstitute.org/collaboration/giant/index.php/File:Meta-analysis_Locke_et_al%2BUKBiobank_2018_UPDATED.txt.gz
+
+#These are two you can play around with later. They are also in the dropbox. you might need to rename the columns
+#T2DGWAS = read.table("~/Library/CloudStorage/Box-Box/HG2553 Main Folder/Collins Lab Collab/GWAS Data - For Glowworm/TransEthnic_T2D_GWAS.MegaMeta.2014OCT16.txt", head=T)
+#BC = read.table("~/Library/CloudStorage/Box-Box/HG2553 Main Folder/Collins Lab Collab/GWAS Data - For Glowworm/BreastCancer_Risk_SNPs.txt", head=T)
+
+
+BMI_GWAS_P = subset(BMI_GWAS, BMI_GWAS$P < 5e-8) #We select only the values which pass out p value cutoff.
+
+ensembl <- useEnsembl(biomart = "snps", mirror = "useast", dataset = "hsapiens_snp") #This pulls a big database down from online which contains the latest information about the genome build. We try to use the same genomic data as what the multiome is aligned to. Sometimes it has trouble accessing the server - the best solution is to change the mirror to uswest, or just wait a little while
+
+GWASClean = getBM(attributes = c('chr_name', 'chrom_start', 'refsnp_id'),
+      filters = 'snp_filter',
+      values = BMI_GWAS_P$SNP, 
+      mart = ensembl) #Here we use that file to get the most up to date coordinates for each SNP in the GWAS
+
+colnames(GWASClean) = c("CHR", "POS", "SNP") #Rename columns to match up with other data. We shoudl have a column with the chromosome, the position in base pairs, and the name of the SNP (usually starts with 'rs')
+```
+
+#Systematically assess if the GWAS SNPs are in open chromatin
+```{r}
+SNP_Results = list()
+Input = GWASClean #This is your cleaned GWAS File
+for(y in c("CM001", "CM002A", "CM002B", "CM003A", "CM003B")){
+SeuData = Multi[[y]]
+CompAssigns = MultiAssign[[y]]
+
+#Adds the assignments to the metadata
+SeuData = AddMetaData(SeuData, CompAssigns, "Pop")
+Idents(SeuData) = "Pop"
+ClusterIds = sort(unique(CompAssigns$Pop))
+
+#Generates a blank table with the multiome coordinates
+PullData = subset(SeuData, idents = ClusterIds[[1]])
+ReducedData = as.data.frame(rowMeans(PullData@assays$peaks@data))
+colnames(ReducedData) = ClusterIds[[1]]
+
+#Fills the table with the average peak data for each cluster 
+for(x in seq(2,length(ClusterIds), 1)){
+PullData = subset(SeuData, idents = ClusterIds[[x]])
+ReducedData2 = as.data.frame(rowMeans(PullData@assays$peaks@data))
+colnames(ReducedData2) = ClusterIds[[x]]  
+ReducedData = merge(ReducedData, ReducedData2, by = 0)
+row.names(ReducedData) = ReducedData$Row.names
+ReducedData$Row.names = NULL
+}
+
+#Here we just reformat the peak information from the multiome file so it is more useable in the next step
+ReducedData = as.data.frame(ReducedData)
+ReducedData$Chrom = vapply(strsplit(row.names(ReducedData), "-", fixed = TRUE), "[", "", 1) #Seperates out the chromosome
+ReducedData$ChromNum = gsub("chr", "", ReducedData$Chrom) #Makes sure the chromosomes are numeric
+ReducedData$Start = as.numeric(vapply(strsplit(row.names(ReducedData), "-", fixed = TRUE), "[", "", 2)) #Gets the position at the start of the chromatin window
+ReducedData$End = as.numeric(vapply(strsplit(row.names(ReducedData), "-", fixed = TRUE), "[", "", 3)) #Gets the position at the end of the chromatin window
+ReducedData$Region_kb = ReducedData$End - ReducedData$Start #Calculates the size of the chromatin window
+
+
+#Setup another blank dataframe - this time we are looking for which GWAS SNPs are in the data
+InDataset = as.data.frame(matrix(ncol =length(row.names(ReducedData))+1, nrow = 0))
+colnames(InDataset) = c(row.names(ReducedData), "SNP")
+
+for(x in seq(1,dim(Input)[1], 1)){
+PullCHR = Input$CHR[[x]]
+PullPOS = as.numeric(Input$POS[[x]])
+PullSNP = Input$SNP[[x]]
+
+ReducedData_BMI = subset(ReducedData, ReducedData$ChromNum == PullCHR & ReducedData$Start <= PullPOS & ReducedData$End >= PullPOS)
+if(dim(ReducedData_BMI)[1] > 0){
+ReducedData_BMI$SNP = PullSNP
+InDataset = rbind(InDataset, ReducedData_BMI)
+}}
+InDataset$SAMPLE = y
+write.csv(InDataset, paste("MultiomeSNPResults_", x, ".csv", sep="")) #Output data for later
+
+SNP_Results[[y]] = InDataset #Store same data in a list
+}
+```
+
+#Selecting SNPs in specific clusters
+```{r}
+#Setup new dataframe. Here we choose which clusters we are interested in, and set a cutoff for what we consider positive expression
+AllData = as.data.frame(matrix(ncol=5, nrow=0))
+colnames(AllData) = c("Chrom", "ChromNum", "SNP", "SAMPLE", "SampleType")
+for(x in c("CM001", "CM003A", "CM003B",  "CM007", "CM008")){
+
+PullData  = SNP_Results[[x]] #or:
+#PullData = read.csv(paste("~/Downloads/Pre-CRISPR Screening-selected/MultiomeSNPResults_", x, ".csv", sep=""), row.names=1)
+
+#Here is where I determine which clusters we want to focus on for downstream processing. I was lazy and didnt properly label my clusters, but essentially you would put in the names of your high POMC clusters. You can add as many 'ifelse' arguments as you need here
+if(x == "CM001"){ClusterCols = c("Clust9", "Clust7") 
+}else if(x == "CM003A"){ClusterCols = c("Clust5", "Clust6", "Clust8")
+}else if(x == "CM003B"){ClusterCols = c("Clust7", "Clust8", "Clust12")
+}else{ClusterCols = grep(colnames(PullData), pattern = "^Clust", value=T)}
+
+ClusterColsData = PullData %>% dplyr::select(ClusterCols)
+PullData$MeanData = rowMeans(ClusterColsData)
+
+PullData2 = subset(PullData, PullData$MeanData > 0.2) #This is a pretty arbritrary cutoff and something we are open to change. We originally had ot at > 0, then > 0.1. As we start prioritizing on other metrics this could be reduced
+ConsolidateData = PullData2 %>% dplyr::select("Chrom", "ChromNum", "SNP", "SAMPLE")
+ConsolidateData$SampleType = ifelse(x %in% c("CM005", "CM007", "CM008"), "Cortical", "POMC") #Here is where you say which samples are cortical and which are POMC neurons
+AllData = rbind(AllData, ConsolidateData)
+}
+```
+
+#Determine specificity across the different neuron types
+```{r}
+#This data frame should contain all of the SNPs which are expressed. We can look at how many are specific here: 
+AllData$X = 1
+AllData2 = AllData %>% group_by(SNP, SampleType) %>% summarise(Count = sum(X))
+AllData2$Dups = duplicated(AllData2$SNP) | duplicated(AllData2$SNP, fromLast=T)
+
+CorticalOnly = subset(AllData2, AllData2$Dups == F & AllData2$SampleType == "Cortical")
+cat(paste("SNPs specific to cortical neurons:", dim(CorticalOnly)[1]))
+POMCOnly = subset(AllData2, AllData2$Dups == F & AllData2$SampleType == "POMC")
+cat(paste("SNPs specific to POMC neurons:", dim(POMCOnly)[1]))
+POMCOnly_AllData = subset(AllData2, AllData2$Dups == F & AllData2$SampleType == "POMC" & AllData2$Count == 3) #Here we want to know how many are specific to POMC, but are open in all the datasets. If you include more than the 3 POMC datasets I used here then change the number accordingly
+cat(paste("SNPs specific to all POMC neurons:", dim(POMCOnly_AllData)[1]))
+BothDataTypes = subset(AllData2, AllData2$Dups == T)
+cat(paste("SNPs expressed in both neuron types:", dim(BothDataTypes)[1]))
+
+#Use the orginal GWAS to get the coordianates for these SNPs
+GetSNPCoords  = subset(GWASClean, GWASClean$SNP %in% POMCOnly_AllData$SNP)
+#We filter the specific POMC cells back through the Ensembl database to get the coordinates
+GetSNPCoords = subset(GetSNPCoords, GetSNPCoords$CHR %in% c(1,2,3,4,5,6,7,8,9,10, 11, 12,13,14,15,16,17,18,19,20, 21, 22, "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "X", "Y"))
+
+GetSNPCoords_Table = as.data.frame(table(GetSNPCoords$CHR)) #This generates a table with the number of SNPs per chromosome. Sometimes we are interested in looking at areas where SNPs are aggregated on a chromosome
+```
+
+#Optional: Choose only regions where SNPs aggregate
+```{r}
+GetSNPCoords_AggTable = subset(GetSNPCoords_Table, GetSNPCoords_Table$Freq > 1)
+
+SNP_Aggregration = list()
+for(x in GetSNPCoords_AggTable$Var1){
+PullSNPs = subset(GetSNPCoords, GetSNPCoords$CHR == x) 
+PullSNPs$No = seq(1,dim(PullSNPs)[1], 1)
+WindowSNPs = as.character()
+for(w in c(1)){ #I keep the default at 1MB (1000000) and use this part to scale up and down (ie change to 0.5 if you want 500kB)
+for(y in seq(1,dim(PullSNPs)[1], 1)){
+PullData = subset(PullSNPs, PullSNPs$No == y)
+PullDataRest = subset(PullSNPs, PullSNPs$No > y)
+MinWindow = PullData$POS - (w*1000000)/2
+MaxWindow = PullData$POS + (w*1000000)/2 
+PullDataRest2 = subset(PullDataRest, PullDataRest$POS > MinWindow & PullDataRest$POS < MaxWindow)
+if(dim(PullDataRest2)[1] > 0){
+PullDataRest2$WindowSNPs = paste(PullData$SNP, PullDataRest2$SNP, sep="_")
+WindowSNPs = c(WindowSNPs, PullDataRest2$WindowSNP)
+}
+}
+SNP_Aggregration[[paste("Chrom", x, "_Window_", w, "MB", sep="")]] = WindowSNPs
+}}
+
+#Here you can just choose one of the regions and it will output all of the unique SNPs for you
+Compile = as.character()
+for(x in GetSNPCoords_AggTable$Var1){
+Compile = c(Compile, SNP_Aggregration[[paste("Chrom", x, "_Window_", 1, "MB", sep="")]])
+}
+Compile2 = unique(unlist(strsplit(Compile, "_", fixed = FALSE)))
+```
+
+#Find genes in region around the SNP
+```{r}
+#Here is a dataframe from Ensembl which contains all the genes, coodinates, chromosomes and biotypes from build GRCh38.p13
+GRCh38.p13_GenomeCoords = read.csv("~/Downloads/GRCh38.p13_GenomeCoords.csv")
+colnames(GRCh38.p13_GenomeCoords) = c("GENE" , "CHR", "START", "STOP", "BIOTYPE")
+
+#This is a function which takes a SNP and outputs which genes are in a given region. It is named GlowwormGenes because it is part of an R package which we are developing for a different project. Input is the data frame you are interested in, the 'snp', 'chr' and 'pos' arguments just specify the name of those columns. The window parameter determines how far away you are interested in searching. It indicate half upstream and half downstream (ie if Window = 100 then it is searching for 50 kb upstream and 10kb downstream). Setting ProteinCoding to TRUE means it will only return protein coding genes. Verbose just indicates whether you want it to tell you at the end how many genes were found. The output is a list containing three options = "FullOutput' has the SNP information, what genes it is linked to and how far away they are. "GenesinWindow" will return a list of all of the unique genes matched to a SNP in the input list, and "NearestNeighborGene" should return only the closest gene for each SNP. Most of the time you are only interested in "GenesinWindow" 
+GlowwormGenes = function(Input, Window = 100, build = "hg38", snp = "SNP", chr = "CHR", bp = "POS", ProteinCoding =T, Verbose = T){
+  OutsList = list()
+   if(build == "hg18"){ genelist <- hg18_GenomeCoords}else if(build == "hg19"){genelist <- hg19_GenomeCoords}else if(build == "hg38"){ genelist <- GRCh38.p13_GenomeCoords}else{stop("Build needs to be hg18, hg19 or hg38. Default is hg38")}
+   if(Window != 100) {Window = as.numeric(Window)}
+  Input <- Input %>% dplyr::rename(rsid = all_of(snp), chromosome = all_of(chr), position = all_of(bp))
+  
+  Input <- sqldf::sqldf(sprintf("select A.*,B.* from\n              Input A left join genelist B\n              ON (A.chromosome == B.CHR and\n              A.position >= B.START - %1$s and\n              A.position <= B.STOP + %1$s)",  Window * 1000))
+#{
+    Input <- Input %>% dplyr::rename(geneSTART = START, geneSTOP = STOP) %>% 
+      dplyr::select(rsid, chromosome, position, geneSTART, geneSTOP, GENE, BIOTYPE)
+Input$distance <- apply(Input, 1, FUN = function(x) {
+      ifelse(!is.na(x["GENE"]) & x["position"] < x["geneSTART"], 
+        -(as.numeric(x["geneSTART"]) - as.numeric(x["position"])), 
+        ifelse(!is.na(x["GENE"]) & x["position"] > x["geneSTOP"], 
+          as.numeric(x["position"]) - as.numeric(x["geneSTOP"]), 
+          ifelse(!is.na(x["GENE"]) & (x["position"] > 
+            x["geneSTART"]) & (x["position"] < x["geneSTOP"]), 
+            0, NA)))
+    })
+  
+if(ProteinCoding == T){
+Input = subset(Input, Input$BIOTYPE =="protein_coding")  
+}
+  
+  OutsList[["FullOutput"]] = Input
+  Input_Mapped = na.omit(Input)
+  OutsList[["GenesinWindow"]] = unique(na.omit(Input$GENE))
+  KNN_Only = Input %>% group_by(rsid) %>% top_n(n=1, wt = -distance)
+  OutsList[["NearestNeighborGene"]] = unique(na.omit(KNN_Only$GENE))
+  if(Verbose == T){cat(paste("Summary of output:\nFrom summary statistics containing ", length(unique(na.omit(Input[[snp]]))), " unique SNPs, ", length(unique(na.omit(Input_Mapped[["rsid"]]))), " were associated with genes within a ", as.numeric(Window)*2, " kB region - see slot 1.\n", length(unique(na.omit(OutsList[["GenesinWindow"]]))), " unique genes were found within the ", as.numeric(Window)*2, " kB total region - see slot 2.\n", length(unique(na.omit(OutsList[["NearestNeighborGene"]]))), " unique nearest neighbor genes were found - see slot 3.", sep=""))}
+  return(OutsList)
+}
+
+PriotSNPs_Genes = GlowwormGenes(Input = GetSNPCoords, Window = 50, build = "hg38", Verbose = T, ProteinCoding =T)
+```
+
+
+#Check genes based on expression
+```{r}
+#There are a lot of ways you could approach checking expression. Here is a quick code I generated to condense it all into one dataframe. Here is one simple version
+
+for(SAMP in c("CM001", "CM003A", "CM003B", "CM007", "CM008")){ #
+SeuData = Multi[[SAMP]]
+Pop = MultiAssign[[SAMP]]
+if(SAMP == "CM001"){ClusterCols = c("Clust9", "Clust7") 
+}else if(SAMP == "CM003A"){ClusterCols = c("Clust5", "Clust6", "Clust8")
+}else if(SAMP == "CM003B"){ClusterCols = c("Clust7", "Clust8", "Clust12")
+}else{ClusterCols = unique(Pop$Pop)}
+
+SeuData = AddMetaData(SeuData, Pop, "Pop")
+Idents(SeuData) = "Pop"
+Seu = subset(SeuData, idents = c(ClusterCols))
+Seu_Clust_Data = as.data.frame(Seu@assays$RNA@data)
+Seu_Clust_Data_GoI = subset(Seu_Clust_Data, row.names(Seu_Clust_Data) %in% PriotSNPs_Genes$GenesinWindow)
+Seu_Clust_Data_GoI = as.data.frame(t(Seu_Clust_Data_GoI))
+Seu_Clust_Data_GoI_Cutoff = as.data.frame(ifelse(Seu_Clust_Data_GoI == 0, 0, 1))
+Seu_Clust_Condense = Seu_Clust_Data_GoI_Cutoff %>% dplyr::summarise_all(.funs = sum)
+Seu_Clust_Condense = as.data.frame(t(Seu_Clust_Condense))
+Seu_Clust_Condense$V1 = Seu_Clust_Condense$V1/dim(Seu)[2]*100
+colnames(Seu_Clust_Condense) = SAMP
+
+if(SAMP == "CM001"){
+Expression  = Seu_Clust_Condense
+  
+}else{
+Expression = merge(Expression, Seu_Clust_Condense, by = 0)
+row.names(Expression) = Expression$Row.names
+Expression$Row.names = NULL
+}
+}
+
+Expression$POMC = rowMeans(Expression[c("CM001",  "CM003A", "CM003B")])
+Expression$Cortical = rowMeans(Expression[c("CM007", "CM008")])
+Expression$Delta = Expression$POMC / Expression$Cortical
+Expression = Expression[order(-Expression$Delta), ]
+Expression$Delta[which(!is.finite(Expression$Delta))] = 100
+
+
+#Here we are selecting for genes which are either highly expressed (Expressed in > 50% of POMC neurons) or are expressed specifically in POMC neurons (Expressed in > 10% of cells and at a 2:1 ratio compared to POMC) 
+StrongExpression = subset(Expression, Expression$Delta >= 2 & Expression$POMC > 10 | Expression$POMC > 50)
+```
+
+
+
+#### TASKS
+1. Try running the full pipeline on the BMI summary statistics using your analysis of samples CM001, 003A, 003B, 007 and 008. Let me know if there are any issues
+2. How many SNPs are in POMC neurons? How many are in cortical? How many are shared? (See 'Determine specificity across the different neuron types' section)
+3. Of the SNPs in POMC neurons, what is their distribution across the chromosomes? (See 'Optional: Choose only regions where SNPs aggregate')
+4. From the SNPs in POMC neurons - how many unique protein coding genes are in a 50, 100, 500 and 1000 KB window? (See 'Find genes in region around the SNP')
+5. Check how many of these genes look like strong candidates (See 'Check genes based on expression')
+6. Go back to the GWAS summary statistics and subset it for the list of SNPs in POMC neurons. Can you order them based on the beta column? this might inform how we prioritize the genes.
+7. Repeat steps 1-5 on some different GWAS: T2D (TransEthnic_T2D_GWAS.MegaMeta.2014OCT16.txt) and breast cancer (BreastCancer_Risk_SNPs.txt)
+
